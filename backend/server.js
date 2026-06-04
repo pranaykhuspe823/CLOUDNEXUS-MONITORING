@@ -366,6 +366,17 @@ function getAWSSvc() {
   return new AWSService(creds);
 }
 
+app.get('/api/aws/s3-details/:bucket', async (req, res) => {
+  const svc = getAWSSvc();
+  if (!svc) return res.status(400).json({ error: 'AWS not connected' });
+  try {
+    const details = await svc.getS3BucketDetails(req.params.bucket);
+    res.json(details);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/aws/install-cwagent', async (req, res) => {
   const { instanceId, region } = req.body;
   if (!instanceId || !region) return res.status(400).json({ error: 'instanceId and region required' });

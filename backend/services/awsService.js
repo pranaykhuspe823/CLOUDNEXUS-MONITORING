@@ -8,7 +8,7 @@ const { RDSClient, DescribeDBInstancesCommand, DescribeDBClustersCommand,
 const { S3Client, ListBucketsCommand, GetBucketLocationCommand, GetBucketAclCommand,
   GetBucketVersioningCommand, GetBucketEncryptionCommand, GetBucketTaggingCommand,
   GetBucketLifecycleConfigurationCommand, ListObjectsV2Command,
-  GetPublicAccessBlockCommand } = require('@aws-sdk/client-s3');
+  GetPublicAccessBlockCommand, GetBucketPolicyCommand } = require('@aws-sdk/client-s3');
 const { LambdaClient, ListFunctionsCommand, GetFunctionCommand,
   GetFunctionConcurrencyCommand, ListLayersCommand } = require('@aws-sdk/client-lambda');
 const { EKSClient, ListClustersCommand, DescribeClusterCommand, ListNodegroupsCommand,
@@ -24,6 +24,8 @@ const { SNSClient, ListTopicsCommand, GetTopicAttributesCommand } = require('@aw
 const { STSClient, GetCallerIdentityCommand } = require('@aws-sdk/client-sts');
 const { IAMClient, ListInstanceProfilesCommand } = require('@aws-sdk/client-iam');
 const { SSMClient, GetInventoryCommand, SendCommandCommand, GetCommandInvocationCommand } = require('@aws-sdk/client-ssm');
+const { Route53Client, ListHostedZonesCommand, ListResourceRecordSetsCommand } = require('@aws-sdk/client-route-53');
+const { LightsailClient, GetInstancesCommand: LightsailGetInstancesCommand, GetDatabasesCommand } = require('@aws-sdk/client-lightsail');
 const { mapFamily, healthFromStatus, estimateMonthlyCost } = require('../utils/normalizer');
 
 // vCPU & memory lookup for common instance families (fallback when DescribeInstanceTypes unavailable)
@@ -230,6 +232,66 @@ class AWSService {
       const valid = filesystems.filter(f => f && f.diskTotalGB > 0);
       return valid.length > 0 ? valid : null;
     } catch { return null; }
+  }
+
+  // On-demand fetch of S3 bucket objects + policy (called when user opens the drawer)
+  async getS3BucketDetails(bucketName) {
+    const result = { objects: [], objectsTotalSizeBytes: 0, hasMoreObjects: false, policy: null };
+
+    // Step 1: detect the bucket's actual region so we use the right endpoint
+    let bucketRegion = this.region || 'us-east-1';
+    try {
+      const globalS3 = new S3Client(this.getClientConfig());
+      const loc = await globalS3.send(new GetBucketLocationCommand({ Bucket: bucketName }));
+      bucketRegion = loc.LocationConstraint || 'us-east-1';
+    } catch (e) {
+      console.error(`[S3] could not get region for ${bucketName}: ${e.message}`);
+    }
+
+    // Step 2: use a regional client for all subsequent calls
+    const s3 = new S3Client(this.getClientConfig(bucketRegion));
+
+    await Promise.allSettled([
+      // Bucket policy
+      s3.send(new GetBucketPolicyCommand({ Bucket: bucketName })).then(p => {
+        try { result.policy = JSON.parse(p.Policy); }
+        catch { result.policy = p.Policy; }
+      }).catch(e => {
+        if (e.name !== 'NoSuchBucketPolicy') {
+          console.error(`[S3] policy error for ${bucketName}: ${e.message}`);
+        }
+      }),
+
+      // Paginated object listing — up to 5000 objects
+      (async () => {
+        try {
+          let token;
+          const MAX = 5000;
+          do {
+            const res = await s3.send(new ListObjectsV2Command({
+              Bucket: bucketName, MaxKeys: 1000, ContinuationToken: token,
+            }));
+            for (const obj of res.Contents || []) {
+              result.objects.push({
+                key:          obj.Key,
+                size:         obj.Size || 0,
+                lastModified: obj.LastModified ? new Date(obj.LastModified).toISOString() : null,
+                storageClass: obj.StorageClass,
+              });
+              result.objectsTotalSizeBytes += obj.Size || 0;
+            }
+            result.hasMoreObjects = !!(res.IsTruncated && result.objects.length >= MAX);
+            token = (res.IsTruncated && result.objects.length < MAX) ? res.NextContinuationToken : undefined;
+          } while (token);
+          console.log(`[S3] listed ${result.objects.length} objects in ${bucketName} (${bucketRegion})`);
+        } catch (e) {
+          console.error(`[S3] list error for ${bucketName}: ${e.message}`);
+          result.listError = e.message;
+        }
+      })(),
+    ]);
+
+    return result;
   }
 
   // Fetch real S3 bucket size from CloudWatch BucketSizeBytes (accurate, no agent, just access keys)
@@ -701,6 +763,11 @@ class AWSService {
           region = loc.LocationConstraint || 'us-east-1';
         }).catch(() => {});
 
+        let policy = null;
+        let objects = [];
+        let objectsTotalSize = 0;
+        let hasMoreObjects = false;
+
         await Promise.allSettled([
           s3.send(new GetBucketVersioningCommand({ Bucket: b.Name })).then(v => {
             versioning = v.Status === 'Enabled';
@@ -719,10 +786,37 @@ class AWSService {
             const cfg = pab.PublicAccessBlockConfiguration || {};
             blockPublicAccess = !!(cfg.BlockPublicAcls || cfg.BlockPublicPolicy || cfg.RestrictPublicBuckets || cfg.IgnorePublicAcls);
           }).catch(() => {}),
+          // Bucket policy
+          s3.send(new GetBucketPolicyCommand({ Bucket: b.Name })).then(p => {
+            try { policy = JSON.parse(p.Policy); } catch { policy = p.Policy; }
+          }).catch(() => {}),
           // Real object count via CloudWatch (no listing limit, accurate total)
           this.getS3ObjectCountFromCloudWatch(b.Name, region).then(count => {
             if (count != null) objectCount = count;
           }),
+          // Paginated object listing — up to 2000 objects for file browser
+          (async () => {
+            try {
+              let token;
+              const MAX = 2000;
+              do {
+                const res = await s3.send(new ListObjectsV2Command({
+                  Bucket: b.Name, MaxKeys: 1000, ContinuationToken: token,
+                }));
+                for (const obj of res.Contents || []) {
+                  objects.push({
+                    key: obj.Key,
+                    size: obj.Size || 0,
+                    lastModified: obj.LastModified,
+                    storageClass: obj.StorageClass,
+                  });
+                  objectsTotalSize += obj.Size || 0;
+                }
+                hasMoreObjects = res.IsTruncated && objects.length >= MAX;
+                token = res.IsTruncated && objects.length < MAX ? res.NextContinuationToken : undefined;
+              } while (token);
+            } catch {}
+          })(),
         ]);
 
         // Real bucket size via CloudWatch BucketSizeBytes (accurate, includes all objects, no 1000-object limit)
@@ -749,6 +843,10 @@ class AWSService {
           networkAccess: blockPublicAccess ? 'private' : 'public',
           creationDate: b.CreationDate,
           cost: Math.max(1, sizeGB * 0.023),
+          policy,
+          objects,
+          objectsTotalSizeBytes: objectsTotalSize,
+          hasMoreObjects,
           tags,
           connections: [],
         });
@@ -1318,6 +1416,145 @@ class AWSService {
     } catch { return []; }
   }
 
+  // ── Route 53 ────────────────────────────────────────────────────────────────
+  async getRoute53HostedZones() {
+    try {
+      const r53 = new Route53Client(this.getClientConfig());
+      const res = await r53.send(new ListHostedZonesCommand({ MaxItems: '100' }));
+      const zones = [];
+      for (const z of res.HostedZones || []) {
+        const zoneId = z.Id.split('/').pop();
+        let recordCount = 0;
+        try {
+          const rr = await r53.send(new ListResourceRecordSetsCommand({ HostedZoneId: zoneId, MaxItems: '1' }));
+          recordCount = z.ResourceRecordSetCount || 0;
+        } catch {}
+        zones.push({
+          id: `aws-r53-${zoneId}`,
+          rawId: zoneId,
+          name: z.Name.replace(/\.$/, ''),
+          type: 'Route 53 Hosted Zone',
+          family: 'DNS',
+          provider: 'aws',
+          region: 'global',
+          status: 'Active',
+          health: 'healthy',
+          isPrivate: z.Config?.PrivateZone || false,
+          networkAccess: z.Config?.PrivateZone ? 'private' : 'public',
+          recordCount,
+          comment: z.Config?.Comment || null,
+          cost: 0.50,
+          tags: {},
+          connections: [],
+        });
+      }
+      return zones;
+    } catch (e) {
+      console.error('Route 53 error:', e.message);
+      return [];
+    }
+  }
+
+  // ── CloudWatch Alarms as resources ──────────────────────────────────────────
+  async getCloudWatchAlarmResources(region) {
+    try {
+      const cw = new CloudWatchClient(this.getClientConfig(region));
+      const res = await cw.send(new DescribeAlarmsCommand({ MaxRecords: 100 }));
+      return (res.MetricAlarms || []).map(a => ({
+        id: `aws-cw-alarm-${region}-${a.AlarmName.replace(/\s+/g, '-')}`,
+        rawId: a.AlarmArn,
+        name: a.AlarmName,
+        type: 'CloudWatch Alarm',
+        family: 'Monitoring',
+        provider: 'aws',
+        region,
+        status: a.StateValue,
+        health: a.StateValue === 'OK' ? 'healthy' : a.StateValue === 'ALARM' ? 'critical' : 'warning',
+        metricName: a.MetricName,
+        namespace: a.Namespace,
+        comparisonOperator: a.ComparisonOperator,
+        threshold: a.Threshold,
+        period: a.Period,
+        alarmDescription: a.AlarmDescription || null,
+        stateReason: a.StateReason || null,
+        alarmActions: a.AlarmActions || [],
+        cost: 0.10,
+        uptime: null,
+        tags: {},
+        connections: [],
+      }));
+    } catch (e) {
+      console.error(`CloudWatch alarm resources error [${region}]:`, e.message);
+      return [];
+    }
+  }
+
+  // ── Lightsail ────────────────────────────────────────────────────────────────
+  async getLightsailInstances(region) {
+    try {
+      const ls = new LightsailClient(this.getClientConfig(region));
+      const [instRes, dbRes] = await Promise.allSettled([
+        ls.send(new LightsailGetInstancesCommand({})),
+        ls.send(new GetDatabasesCommand({})),
+      ]);
+      const resources = [];
+
+      for (const i of instRes.value?.instances || []) {
+        resources.push({
+          id: `aws-ls-${i.name}`,
+          rawId: i.arn,
+          name: i.name,
+          type: 'Lightsail Instance',
+          family: 'Compute',
+          provider: 'aws',
+          region: i.location?.regionName || region,
+          az: i.location?.availabilityZone,
+          status: i.state?.name || 'unknown',
+          health: i.state?.name === 'running' ? 'healthy' : healthFromStatus(i.state?.name),
+          ip: i.privateIpAddress,
+          publicIp: i.publicIpAddress,
+          blueprintName: i.blueprintName,
+          bundleId: i.bundleId,
+          vcpu: i.hardware?.cpuCount,
+          memGiB: i.hardware?.ramSizeInGb,
+          storageGB: (i.hardware?.disks || []).reduce((a, d) => a + (d.sizeInGb || 0), 0),
+          launchTime: i.createdAt,
+          uptime: i.createdAt ? formatUptime(i.createdAt) : null,
+          cost: estimateMonthlyCost({ family: 'Compute' }),
+          tags: Object.fromEntries((i.tags || []).map(t => [t.key, t.value])),
+          connections: [],
+        });
+      }
+
+      for (const db of dbRes.value?.relationalDatabases || []) {
+        resources.push({
+          id: `aws-ls-db-${db.name}`,
+          rawId: db.arn,
+          name: db.name,
+          type: 'Lightsail Database',
+          family: 'Database',
+          provider: 'aws',
+          region: db.location?.regionName || region,
+          status: db.state,
+          health: db.state === 'available' ? 'healthy' : healthFromStatus(db.state),
+          engine: db.relationalDatabaseBlueprintId,
+          endpoint: db.masterEndpoint?.address,
+          port: db.masterEndpoint?.port,
+          launchTime: db.createdAt,
+          uptime: db.createdAt ? formatUptime(db.createdAt) : null,
+          cost: estimateMonthlyCost({ family: 'Database' }),
+          tags: Object.fromEntries((db.tags || []).map(t => [t.key, t.value])),
+          connections: [],
+        });
+      }
+
+      return resources;
+    } catch (e) {
+      console.error(`Lightsail error [${region}]:`, e.message);
+      return [];
+    }
+  }
+
   async getAllResources() {
     // Determine regions to scan: explicit creds.regions, environment override, 'all' keyword, or default region
     const envRegions = process.env.AWS_REGIONS ? process.env.AWS_REGIONS.split(',').map(r => r.trim()).filter(Boolean) : null;
@@ -1331,6 +1568,9 @@ class AWSService {
     const allRegions = [...new Set([...regions, ...s3Regions])];
 
     const results = await Promise.allSettled([
+      // Route 53 & Lightsail are global/single-region calls
+      this.getRoute53HostedZones(),
+      this.getLightsailInstances(this.region),
       ...allRegions.flatMap(r => [
         this.getEC2Instances(r),
         this.getRDSInstances(r),
@@ -1343,6 +1583,7 @@ class AWSService {
         this.getAllSecurityGroups(r),
         this.getRouteTables(r),
         this.getEFSStorageFromCloudWatch(r),
+        this.getCloudWatchAlarmResources(r),
       ]),
     ]);
 

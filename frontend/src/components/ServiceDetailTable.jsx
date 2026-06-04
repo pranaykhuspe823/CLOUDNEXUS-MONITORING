@@ -1,4 +1,5 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { PROVIDER_META, fmt, STATUS_COLORS } from '../utils/theme';
 import ServiceLogo from './ServiceLogo';
 
@@ -21,9 +22,109 @@ function getUsageColor(val) {
   return '#22c55e';
 }
 
+function getCriticalReason(s) {
+  const status = (s.status || '').toLowerCase();
+
+  if (['stopped', 'stopping'].includes(status))
+    return `Instance is stopped and not running. Start it from the console to restore service.`;
+  if (['terminated', 'shutting-down'].includes(status))
+    return `Instance has been terminated. It is no longer running and cannot be restarted.`;
+  if (status === 'deallocated')
+    return `VM is deallocated. It is stopped and compute charges have ceased.`;
+  if (['failed', 'error', 'unhealthy'].includes(status))
+    return `Service is in a failed/error state (status: ${s.status}). Check provider console for details.`;
+  if (status === 'degraded')
+    return `Service is degraded. Some components may not be functioning correctly.`;
+
+  if (s.cpu != null && s.cpu >= 90)
+    return `CPU usage critically high at ${s.cpu.toFixed(1)}%. The instance may become unresponsive.`;
+  if (s.cpu != null && s.cpu >= 80)
+    return `CPU usage is high at ${s.cpu.toFixed(1)}%, approaching critical threshold.`;
+
+  if (s.freeStorageGB != null && s.allocatedStorageGB) {
+    const usedPct = ((s.allocatedStorageGB - s.freeStorageGB) / s.allocatedStorageGB) * 100;
+    if (usedPct >= 90)
+      return `Storage critically full: ${usedPct.toFixed(1)}% used (${s.freeStorageGB} GB free of ${s.allocatedStorageGB} GB).`;
+  }
+
+  if (s.health === 'critical' && s.provisioningState && s.provisioningState !== 'Succeeded')
+    return `Provisioning failed (state: ${s.provisioningState}). Check the Azure portal for error details.`;
+
+  if (s.health === 'critical')
+    return `Service health is critical (status: ${s.status || 'unknown'}). Investigate in the cloud console immediately.`;
+
+  return null;
+}
+
+function HealthTooltip({ anchorRect, reason }) {
+  if (!anchorRect || !reason) return null;
+
+  const TIP_W = 260;
+  const GAP   = 8;
+  const vw    = window.innerWidth;
+  const vh    = window.innerHeight;
+
+  // Centre above the badge
+  let left = anchorRect.left + anchorRect.width / 2 - TIP_W / 2;
+  let top  = anchorRect.top - GAP;
+  let showBelow = false;
+
+  // Clamp horizontally
+  if (left < GAP) left = GAP;
+  if (left + TIP_W > vw - GAP) left = vw - TIP_W - GAP;
+
+  // If not enough room above, flip below
+  if (anchorRect.top < 120) {
+    top = anchorRect.bottom + GAP;
+    showBelow = true;
+  }
+
+  // Arrow horizontal position relative to tooltip box
+  const arrowLeft = Math.max(12, Math.min(
+    anchorRect.left + anchorRect.width / 2 - left - 6,
+    TIP_W - 24,
+  ));
+
+  return createPortal(
+    <div style={{
+      position: 'fixed', left, top,
+      transform: showBelow ? 'none' : 'translateY(-100%)',
+      width: TIP_W, zIndex: 99999, pointerEvents: 'none',
+      background: '#1e1e2e',
+      border: '1px solid rgba(239,68,68,0.45)',
+      borderRadius: 8, padding: '9px 13px',
+      fontSize: 12, color: '#f1f5f9', lineHeight: 1.65,
+      boxShadow: '0 6px 24px rgba(0,0,0,0.5)',
+      whiteSpace: 'normal', textAlign: 'left',
+    }}>
+      <div style={{ fontWeight: 700, color: '#ef4444', marginBottom: 5, fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+        Why Critical?
+      </div>
+      {reason}
+      {/* Arrow */}
+      <div style={{
+        position: 'absolute',
+        ...(showBelow
+          ? { top: -6, bottom: 'auto' }
+          : { bottom: -6, top: 'auto' }),
+        left: arrowLeft,
+        width: 0, height: 0,
+        borderLeft: '6px solid transparent',
+        borderRight: '6px solid transparent',
+        ...(showBelow
+          ? { borderBottom: '6px solid rgba(239,68,68,0.45)', borderTop: 'none' }
+          : { borderTop: '6px solid rgba(239,68,68,0.45)', borderBottom: 'none' }),
+      }} />
+    </div>,
+    document.body,
+  );
+}
+
 function ServiceRow({ s, provider, onClick }) {
   const meta = PROVIDER_META[provider];
   const cost = s.cost || s.costMonth || 0;
+  const [anchorRect, setAnchorRect] = useState(null);
+  const badgeRef = useRef(null);
 
   // Build spec string
   let spec = '';
@@ -96,9 +197,22 @@ function ServiceRow({ s, provider, onClick }) {
       <td className="cost-cell" style={{ color: meta.color }}>{fmt.usd2(cost)}</td>
       <td style={{ fontSize: 11, color: 'var(--text3)' }}>{s.uptime || '—'}</td>
       <td>
-        <span className={`badge badge-${s.health}`}>
-          {s.health === 'healthy' ? '✓ Healthy' : s.health === 'warning' ? '⚠ Warning' : s.health === 'critical' ? '✗ Critical' : s.health || '—'}
-        </span>
+        {s.health === 'critical' ? (
+          <div style={{ display: 'inline-block' }}
+            ref={badgeRef}
+            onMouseEnter={() => setAnchorRect(badgeRef.current?.getBoundingClientRect() ?? null)}
+            onMouseLeave={() => setAnchorRect(null)}
+          >
+            <span className="badge badge-critical" style={{ cursor: 'help' }}>
+              ✗ Critical
+            </span>
+            <HealthTooltip anchorRect={anchorRect} reason={getCriticalReason(s)} />
+          </div>
+        ) : (
+          <span className={`badge badge-${s.health}`}>
+            {s.health === 'healthy' ? '✓ Healthy' : s.health === 'warning' ? '⚠ Warning' : s.health || '—'}
+          </span>
+        )}
       </td>
     </tr>
   );

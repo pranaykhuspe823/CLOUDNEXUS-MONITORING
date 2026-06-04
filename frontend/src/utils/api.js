@@ -42,6 +42,9 @@ export const api = {
   deleteReportSchedule: (email) => request('DELETE', '/reports/schedule', { email }),
   sendReportNow: (email) => request('POST', '/reports/send-now', { email }),
 
+  // S3 on-demand details (objects + policy)
+  getS3Details: (bucket) => request('GET', `/aws/s3-details/${encodeURIComponent(bucket)}`),
+
   // Topology
   getTopology: () => request('GET', '/topology'),
 

@@ -23,6 +23,10 @@ const SERVICE_MAP = {
   'VPC':                    { abbr: 'VPC',  bg: '#8C4FFF', fg: '#fff' },
   'Internet Gateway':       { abbr: 'IGW',  bg: '#8C4FFF', fg: '#fff' },
   'NAT Gateway':            { abbr: 'NAT',  bg: '#8C4FFF', fg: '#fff' },
+  'Route 53 Hosted Zone':   { abbr: 'R53',  bg: '#9B59B6', fg: '#fff' },
+  'CloudWatch Alarm':       { abbr: 'CWA',  bg: '#E67E22', fg: '#fff' },
+  'Lightsail Instance':     { abbr: 'LS',   bg: '#FF9900', fg: '#fff' },
+  'Lightsail Database':     { abbr: 'LSD',  bg: '#2E73B8', fg: '#fff' },
 
   // ── GCP ───────────────────────────────────────────────────────────────────
   'Compute Engine VM':      { abbr: 'GCE',  bg: '#4285F4', fg: '#fff' },
@@ -57,6 +61,8 @@ const FAMILY_MAP = {
   Cache:      { abbr: 'CAC', bg: '#C7131F', fg: '#fff' },
   Analytics:  { abbr: 'ANL', bg: '#0891b2', fg: '#fff' },
   Security:   { abbr: 'SEC', bg: '#DD344C', fg: '#fff' },
+  DNS:        { abbr: 'DNS', bg: '#9B59B6', fg: '#fff' },
+  Monitoring: { abbr: 'MON', bg: '#E67E22', fg: '#fff' },
 };
 
 const DEFAULT = { abbr: 'SVC', bg: '#94a3b8', fg: '#fff' };

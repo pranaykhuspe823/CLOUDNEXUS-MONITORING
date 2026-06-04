@@ -1,6 +1,10 @@
-import React, { useState, useMemo } from 'react';
-import { ComposableMap, Geographies, Geography, Marker } from 'react-simple-maps';
+import React, { useState, useMemo, useRef, useCallback } from 'react';
+import { ComposableMap, Geographies, Geography, Marker, ZoomableGroup } from 'react-simple-maps';
 import ProviderLogo from './ProviderLogo';
+
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
 
 // World topology from Natural Earth (CDN, ~100 KB)
 const GEO_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
@@ -70,6 +74,38 @@ function getHealth(services) {
 
 export default function RegionMap({ allServices }) {
   const [hovered, setHovered] = useState(null);
+  const [position, setPosition] = useState({ coordinates: [78.96, 20.59], zoom: 4 });
+  const animRef = useRef(null);
+
+  const flyTo = useCallback((targetCoords, targetZoom = 8) => {
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+
+    const startCoords = position.coordinates;
+    const startZoom   = position.zoom;
+    const midZoom     = Math.max(1.2, Math.min(startZoom, targetZoom) * 0.35); // zoom-out valley
+    const duration    = 1200; // ms total
+    const startTime   = performance.now();
+
+    function step(now) {
+      const t      = Math.min((now - startTime) / duration, 1);
+      const eased  = easeInOutCubic(t);
+
+      // Coordinates: linear lerp with easing
+      const lon = startCoords[0] + (targetCoords[0] - startCoords[0]) * eased;
+      const lat = startCoords[1] + (targetCoords[1] - startCoords[1]) * eased;
+
+      // Zoom: parabolic arc — valley at t=0.5 for the "fly over" effect
+      const zoom = t < 0.5
+        ? startZoom  + (midZoom    - startZoom)  * easeInOutCubic(t * 2)
+        : midZoom    + (targetZoom - midZoom)     * easeInOutCubic((t - 0.5) * 2);
+
+      setPosition({ coordinates: [lon, lat], zoom });
+
+      if (t < 1) animRef.current = requestAnimationFrame(step);
+    }
+
+    animRef.current = requestAnimationFrame(step);
+  }, [position]);
 
   const byRegion = useMemo(() => {
     const map = {};
@@ -105,27 +141,43 @@ export default function RegionMap({ allServices }) {
 
   return (
     <div className="section-card">
-      <div className="section-title">🌍 Regional Distribution
+      <div className="section-title">Regional Distribution
         <span style={{ marginLeft: 'auto', fontSize: 11, fontWeight: 400, color: 'var(--text3)' }}>
           {markers.length} active regions · {allServices.length} services
         </span>
       </div>
 
-      {/* Map container */}
+      {/* Map container — fixed rectangle, scroll/drag to pan */}
       <div style={{
         position: 'relative', borderRadius: 12,
         background: '#060e2a',
         border: '1px solid rgba(0,180,216,0.2)',
         overflow: 'hidden',
+        height: 420,
         boxShadow: 'inset 0 0 60px rgba(0,10,40,0.8)',
       }}>
+        {/* Zoom controls */}
+        <div style={{ position: 'absolute', top: 10, left: 10, zIndex: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {[
+            { label: '+', action: () => setPosition(p => ({ ...p, zoom: Math.min(p.zoom * 1.5, 20) })) },
+            { label: '−', action: () => setPosition(p => ({ ...p, zoom: Math.max(p.zoom / 1.5, 1) })) },
+            { label: '⊙', action: () => flyTo([78.96, 20.59], 4) },
+          ].map(({ label, action }) => (
+            <button key={label} onClick={action} style={{
+              width: 28, height: 28, borderRadius: 6, border: '1px solid rgba(0,180,216,0.3)',
+              background: 'rgba(6,14,42,0.9)', color: 'rgba(255,255,255,0.8)',
+              fontSize: 15, fontWeight: 700, cursor: 'pointer', lineHeight: 1,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>{label}</button>
+          ))}
+        </div>
+
         <ComposableMap
           projection="geoMercator"
           projectionConfig={{ scale: 155, center: [10, 15] }}
-          style={{ width: '100%', height: 'auto' }}
+          style={{ width: '100%', height: '100%' }}
         >
           <defs>
-            {/* Glow filter for continent outlines */}
             <filter id="neon-glow" x="-10%" y="-10%" width="120%" height="120%">
               <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur" />
               <feMerge>
@@ -133,7 +185,6 @@ export default function RegionMap({ allServices }) {
                 <feMergeNode in="SourceGraphic" />
               </feMerge>
             </filter>
-            {/* Marker glow */}
             <filter id="marker-glow" x="-50%" y="-50%" width="200%" height="200%">
               <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
               <feMerge>
@@ -141,7 +192,6 @@ export default function RegionMap({ allServices }) {
                 <feMergeNode in="SourceGraphic" />
               </feMerge>
             </filter>
-            {/* Cyan→Purple gradient across full map width */}
             <linearGradient id="outlineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
               <stop offset="0%"   stopColor="#00e5ff" />
               <stop offset="45%"  stopColor="#2979ff" />
@@ -149,6 +199,13 @@ export default function RegionMap({ allServices }) {
             </linearGradient>
           </defs>
 
+          <ZoomableGroup
+            zoom={position.zoom}
+            center={position.coordinates}
+            onMoveEnd={({ coordinates, zoom }) => setPosition({ coordinates, zoom })}
+            minZoom={1}
+            maxZoom={20}
+          >
           {/* Continent outlines — glow layer (thick, blurred) */}
           <Geographies geography={GEO_URL}>
             {({ geographies }) =>
@@ -238,6 +295,7 @@ export default function RegionMap({ allServices }) {
               </Marker>
             );
           })}
+          </ZoomableGroup>
         </ComposableMap>
 
         {/* Hover detail panel */}
@@ -297,7 +355,7 @@ export default function RegionMap({ allServices }) {
         </div>
       </div>
 
-      {/* Region pills */}
+      {/* Region pills — click to fly to that region on the map */}
       <div style={{ display: 'flex', gap: 6, marginTop: 12, flexWrap: 'wrap' }}>
         {markers
           .sort((a, b) => b.svcs.length - a.svcs.length)
@@ -305,6 +363,7 @@ export default function RegionMap({ allServices }) {
             <div key={m.id}
               onMouseEnter={() => setHovered(m.id)}
               onMouseLeave={() => setHovered(null)}
+              onClick={() => flyTo([m.lon, m.lat], 8)}
               style={{
                 padding: '4px 10px', borderRadius: 20, cursor: 'pointer',
                 background: hovered === m.id ? `${PROVIDER_COLOR[m.provider]}20` : 'var(--card2)',

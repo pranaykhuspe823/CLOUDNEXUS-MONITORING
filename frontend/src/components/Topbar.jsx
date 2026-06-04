@@ -52,7 +52,7 @@ export default function Topbar({ mode, onModeChange, onRefresh, lastRefresh, con
         <button className="icon-btn" onClick={onOpenConnect}>🔌 Connect</button>
         <button className="icon-btn" onClick={onExport} title="Export Report"
           style={{ background: 'linear-gradient(135deg,#1d4ed8,#3b82f6)', color:'white', border:'none', fontWeight:600 }}>
-          ⬇ Export
+          ⬇ Report
         </button>
         <button className={`icon-btn ${spinning ? 'spin' : ''}`} onClick={handleRefresh} title="Refresh">↻</button>
       </div>

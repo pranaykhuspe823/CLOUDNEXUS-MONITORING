@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { PROVIDER_META, fmt, FAMILY_ICONS, COLORS } from '../utils/theme';
+import { api } from '../utils/api';
 import { PieChart3D } from './SpaceUtilizationCharts';
 
 function getUsageColor(val) {
@@ -136,7 +137,105 @@ function RulesTable({ rules, direction }) {
   );
 }
 
+function fmtBytes(bytes) {
+  if (!bytes) return '0 B';
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(2)} MB`;
+  if (bytes >= 1024)      return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function buildTree(objects) {
+  const folders = {};
+  const rootFiles = [];
+  for (const obj of objects || []) {
+    const parts = obj.key.split('/');
+    if (parts.length === 1 || (parts.length === 2 && parts[1] === '')) {
+      if (parts[0]) rootFiles.push(obj);
+    } else {
+      const folder = parts[0];
+      if (!folders[folder]) folders[folder] = { name: folder, files: [], size: 0 };
+      folders[folder].files.push({ ...obj, shortKey: parts.slice(1).join('/') });
+      folders[folder].size += obj.size || 0;
+    }
+  }
+  return { folders: Object.values(folders).sort((a, b) => b.size - a.size), rootFiles };
+}
+
+function S3FileBrowser({ objects, hasMore }) {
+  const [openFolder, setOpenFolder] = useState(null);
+  const { folders, rootFiles } = buildTree(objects);
+
+  const rowStyle = {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    padding: '5px 8px', borderRadius: 5, fontSize: 12,
+  };
+  const sizeStyle = { color: 'var(--text3)', fontSize: 11, whiteSpace: 'nowrap', marginLeft: 8 };
+
+  return (
+    <div style={{ border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden', maxHeight: 340, overflowY: 'auto' }}>
+      {folders.map(folder => (
+        <div key={folder.name}>
+          <div
+            style={{ ...rowStyle, cursor: 'pointer', background: openFolder === folder.name ? 'var(--bg)' : '', borderBottom: '0.5px solid var(--border)' }}
+            onClick={() => setOpenFolder(openFolder === folder.name ? null : folder.name)}
+          >
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <span style={{ color: '#eab308', fontSize: 13 }}>{openFolder === folder.name ? '▾' : '▸'}</span>
+              <span style={{ fontSize: 13 }}>📁</span>
+              {folder.name}/
+            </span>
+            <span style={sizeStyle}>{folder.files.length} files · {fmtBytes(folder.size)}</span>
+          </div>
+          {openFolder === folder.name && folder.files.map((f, i) => (
+            <div key={i} style={{ ...rowStyle, paddingLeft: 28, background: i % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.02)', borderBottom: '0.5px solid var(--border)' }}>
+              <span style={{ color: 'var(--text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 5 }}>
+                <span style={{ fontSize: 12 }}>📄</span>{f.shortKey}
+              </span>
+              <span style={sizeStyle}>{fmtBytes(f.size)}</span>
+            </div>
+          ))}
+        </div>
+      ))}
+      {rootFiles.map((f, i) => (
+        <div key={i} style={{ ...rowStyle, borderBottom: '0.5px solid var(--border)', background: i % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.02)' }}>
+          <span style={{ color: 'var(--text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 5 }}>
+            <span style={{ fontSize: 12 }}>📄</span>{f.key}
+          </span>
+          <span style={sizeStyle}>{fmtBytes(f.size)}</span>
+        </div>
+      ))}
+      {folders.length === 0 && rootFiles.length === 0 && (
+        <div style={{ padding: '16px', textAlign: 'center', color: 'var(--text3)', fontSize: 12 }}>Bucket is empty</div>
+      )}
+      {hasMore && (
+        <div style={{ padding: '8px 12px', fontSize: 11, color: 'var(--text3)', textAlign: 'center', borderTop: '0.5px solid var(--border)' }}>
+          Showing first 2000 objects — bucket has more
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ResourceDetailDrawer({ resource: s, open, onClose, allServices }) {
+  const [s3Details, setS3Details] = useState(null);
+  const [s3Loading, setS3Loading] = useState(false);
+  const [activeSG, setActiveSG] = useState(null); // SG resource currently expanded
+
+  useEffect(() => {
+    setActiveSG(null);
+    if (!open || s?.type !== 'S3 Bucket' || !s?.rawId) {
+      setS3Details(null);
+      return;
+    }
+    setS3Loading(true);
+    setS3Details(null);
+    api.getS3Details(s.rawId)
+      .then(data => setS3Details(data))
+      .catch(err => setS3Details({ error: err.message }))
+      .finally(() => setS3Loading(false));
+  }, [open, s?.rawId]);
+
   if (!open || !s) return null;
 
   const provider = s.id?.split('-')[0] === 'aws' ? 'aws'
@@ -279,11 +378,94 @@ export default function ResourceDetailDrawer({ resource: s, open, onClose, allSe
                 {s.subnetwork && <KVRow k="Subnetwork" v={s.subnetwork} />}
                 {s.network && <KVRow k="Network" v={s.network} />}
                 {s.securityGroups && s.securityGroups.length > 0 && (
-                  <KVRow k="Security Groups" v={s.securityGroups.map(sgLabel).join(', ')} />
+                  <>
+                    <span className="drawer-key">Security Groups</span>
+                    <span className="drawer-val" style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                      {s.securityGroups.map((sg, i) => {
+                        const sgId   = sg.id || sg;
+                        const sgName = sg.name || sgId;
+                        const sgFull = allServices?.find(svc =>
+                          svc.type === 'Security Group' && (svc.rawId === sgId || svc.id === sgId || svc.name === sgId)
+                        );
+                        const isOpen = activeSG?.rawId === sgId || activeSG?.id === sgId;
+                        return (
+                          <span
+                            key={i}
+                            onClick={() => setActiveSG(isOpen ? null : (sgFull || { rawId: sgId, name: sgName, noData: true }))}
+                            style={{
+                              fontSize: 11, padding: '2px 9px', borderRadius: 5,
+                              background: isOpen ? 'rgba(129,140,248,0.18)' : 'rgba(129,140,248,0.08)',
+                              border: `1px solid ${isOpen ? '#818cf8' : 'rgba(129,140,248,0.35)'}`,
+                              color: '#818cf8', cursor: 'pointer', fontFamily: 'monospace',
+                              transition: 'all 0.15s', userSelect: 'none',
+                            }}
+                          >
+                            {sgName} {sgFull ? '▾' : '?'}
+                          </span>
+                        );
+                      })}
+                    </span>
+                  </>
                 )}
                 {s.networkIn && <KVRow k="Network In" v={`${s.networkIn} KB/s`} />}
                 {s.networkOut && <KVRow k="Network Out" v={`${s.networkOut} KB/s`} />}
               </div>
+            </div>
+          )}
+
+          {/* Inline Security Group Detail — shown when user clicks a SG chip on an EC2 */}
+          {activeSG && s.type !== 'Security Group' && (
+            <div className="drawer-section" style={{ border: '1px solid rgba(129,140,248,0.35)', borderRadius: 10, padding: '14px 16px', background: 'rgba(129,140,248,0.04)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 13, color: 'var(--text)' }}>
+                    {activeSG.name}
+                  </div>
+                  <div style={{ fontSize: 11, fontFamily: 'monospace', color: 'var(--text3)', marginTop: 2 }}>
+                    {activeSG.rawId}
+                    {activeSG.vpcId && <span style={{ marginLeft: 8 }}>VPC: {activeSG.vpcId}</span>}
+                    {activeSG.region && <span style={{ marginLeft: 8 }}>{activeSG.region}</span>}
+                  </div>
+                  {activeSG.description && (
+                    <div style={{ fontSize: 11, color: 'var(--text3)', marginTop: 3 }}>{activeSG.description}</div>
+                  )}
+                </div>
+                <button
+                  onClick={() => setActiveSG(null)}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text3)', fontSize: 16 }}
+                >✕</button>
+              </div>
+
+              {activeSG.noData ? (
+                <div style={{ fontSize: 12, color: 'var(--text3)' }}>
+                  Full rules not available — this SG may be in a different region or not yet fetched.
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                  {/* Inbound */}
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                      <span className="rules-dir-badge rules-inbound" style={{ fontSize: 10 }}>↓ Inbound</span>
+                      <span style={{ fontSize: 11, color: 'var(--text3)' }}>{(activeSG.inboundRules || []).length} rules</span>
+                    </div>
+                    {!(activeSG.inboundRules?.length)
+                      ? <div style={{ fontSize: 11, color: 'var(--text3)' }}>No inbound rules</div>
+                      : <RulesTable rules={activeSG.inboundRules} direction="Inbound" />
+                    }
+                  </div>
+                  {/* Outbound */}
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                      <span className="rules-dir-badge rules-outbound" style={{ fontSize: 10 }}>↑ Outbound</span>
+                      <span style={{ fontSize: 11, color: 'var(--text3)' }}>{(activeSG.outboundRules || []).length} rules</span>
+                    </div>
+                    {!(activeSG.outboundRules?.length)
+                      ? <div style={{ fontSize: 11, color: 'var(--text3)' }}>No outbound rules</div>
+                      : <RulesTable rules={activeSG.outboundRules} direction="Outbound" />
+                    }
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -483,16 +665,77 @@ export default function ResourceDetailDrawer({ resource: s, open, onClose, allSe
           {/* Storage-specific */}
           {s.sizeGB !== undefined && (
             <div className="drawer-section">
-              <div className="drawer-section-title">📦 Storage Details</div>
+              <div className="drawer-section-title">Storage Details</div>
               <div className="drawer-kv">
-                {s.sizeGB && <KVRow k="Total Size" v={`${s.sizeGB.toLocaleString()} GB`} />}
-                {s.objects && <KVRow k="Objects" v={fmt.num(s.objects)} />}
+                {s.sizeGB > 0 && <KVRow k="Total Size (CloudWatch)" v={`${s.sizeGB.toLocaleString()} GB`} />}
+                {s.objectsTotalSizeBytes > 0 && <KVRow k="Listed Size" v={fmtBytes(s.objectsTotalSizeBytes)} />}
+                {s.objectCount != null && <KVRow k="Total Objects" v={fmt.num(s.objectCount)} />}
                 {s.blobCount && <KVRow k="Blobs" v={fmt.num(s.blobCount)} />}
                 {s.storageClass && <KVRow k="Storage Class" v={s.storageClass} />}
                 {s.accessTier && <KVRow k="Access Tier" v={s.accessTier} />}
                 {s.encryption && <KVRow k="Encryption" v={s.encryption} />}
                 {s.versioning !== undefined && <KVRow k="Versioning" v={s.versioning ? 'Enabled' : 'Disabled'} />}
+                {s.blockPublicAccess !== undefined && <KVRow k="Public Access Block" v={s.blockPublicAccess ? 'Enabled' : 'Disabled'} />}
               </div>
+            </div>
+          )}
+
+          {/* S3 File Browser */}
+          {s.type === 'S3 Bucket' && (
+            <div className="drawer-section">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                <div className="drawer-section-title" style={{ margin: 0 }}>
+                  Files &amp; Folders
+                  {s3Details?.hasMoreObjects && <span style={{ fontSize: 10, color: 'var(--text3)', fontWeight: 400, marginLeft: 6 }}>(first 5000 shown)</span>}
+                </div>
+                {!s3Loading && s3Details && (
+                  <span style={{ fontSize: 11, color: 'var(--text3)' }}>
+                    {(s3Details.objects || []).length} listed · {fmtBytes(s3Details.objectsTotalSizeBytes)}
+                  </span>
+                )}
+              </div>
+              {s3Loading && (
+                <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text3)', fontSize: 13 }}>
+                  <div style={{ marginBottom: 8 }}>Fetching files from S3...</div>
+                  <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', background: '#FF9900', width: '60%', borderRadius: 2, animation: 'loadingSlide 1.2s linear infinite' }} />
+                  </div>
+                </div>
+              )}
+              {!s3Loading && s3Details?.error && (
+                <div style={{ fontSize: 12, color: '#ef4444', padding: '8px 0' }}>
+                  Error: {s3Details.error}
+                </div>
+              )}
+              {!s3Loading && s3Details && !s3Details.error && (
+                <S3FileBrowser objects={s3Details.objects} hasMore={s3Details.hasMoreObjects} />
+              )}
+            </div>
+          )}
+
+          {/* S3 Bucket Policy */}
+          {s.type === 'S3 Bucket' && (
+            <div className="drawer-section">
+              <div className="drawer-section-title">Bucket Policy</div>
+              {s3Loading && (
+                <div style={{ fontSize: 12, color: 'var(--text3)' }}>Fetching policy...</div>
+              )}
+              {!s3Loading && s3Details?.policy && (
+                <pre style={{
+                  background: 'var(--bg)', border: '0.5px solid var(--border)',
+                  borderRadius: 8, padding: '12px 14px',
+                  fontSize: 11, color: 'var(--text2)', lineHeight: 1.6,
+                  overflowX: 'auto', maxHeight: 300, overflowY: 'auto',
+                  whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0,
+                }}>
+                  {JSON.stringify(s3Details.policy, null, 2)}
+                </pre>
+              )}
+              {!s3Loading && s3Details && !s3Details.policy && (
+                <div style={{ fontSize: 12, color: 'var(--text3)', padding: '10px 0' }}>
+                  No bucket policy attached
+                </div>
+              )}
             </div>
           )}
 
